@@ -35,7 +35,7 @@ class PldmLink(Link):
 
 def run(link, kinds=('request', 'response', 'error'), **settings):
     for name, value in {'pec_mode': hla.PEC_PRESENT, 'address_filter': '', 'other_transfers': hla.OTHER_HIDE,
-                        'spdm_mode': hla.SPDM_ALL, 'pldm_mode': hla.PLDM_ON, **settings}.items():
+                        'spdm_mode': hla.SPDM_ALL, 'pldm_mode': hla.PLDM_ON, 'spdm_columns': hla.SPDM_COLUMNS_FULL, **settings}.items():
         setattr(hla.Hla, name, value)
     analyzer = hla.Hla()
     out = []
@@ -117,7 +117,7 @@ class Tests(unittest.TestCase):
         self.assertIn('offset=0x100 length=256', s[10])
         self.assertEqual(out[11].data['data_length'], 256)
         self.assertIn('(261 bytes)', s[11])
-        self.assertEqual(out[11].data['src_eid'], 8)
+        self.assertEqual(out[11].data['src_eid'], '0x08')
         self.assertEqual(out[12].data['result'], 'success')
         self.assertIn('DOWNLOAD (was READY_XFER) | 50%', s[15])
         self.assertEqual(out[17].type, 'error')

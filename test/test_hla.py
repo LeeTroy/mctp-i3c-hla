@@ -1,4 +1,4 @@
-# Feeds synthetic MIPI I3C LLA frames to the HLA and checks the decoded output.
+# Feeds synthetic MIPI I3C LLA and XyphroLabs I3C LLA frames to the HLA and checks the decoded output.
 # Run: python3 test/test_hla.py
 
 import os
@@ -87,6 +87,66 @@ class Bus:
             self.add('write', data=b, parity_ok=True)
 
 
+class XyphroBus(Bus):
+    """Builds the frame sequence the XyphroLabs I3C LLA emits: raw T-bits, preambles, parity bits and CRC-5."""
+
+    def write(self, address, data, ack=True):
+        self.start()
+        self.add('address', address=address, read=False, ack=ack)
+        for b in data:
+            t_bit = 0 if hla.odd_parity(b) else 1
+            self.add('data', data=b, ack=t_bit == 0)
+
+    def read(self, address, data):
+        self.start()
+        self.add('address', address=address, read=True, ack=True)
+        for i, b in enumerate(data):
+            self.add('data', data=b, ack=i == len(data) - 1)  # T-bit 1 = more data
+
+    def ccc(self, code, data=()):
+        self.write(0x7E, [code] + list(data))
+
+    def ddr_word(self, type, word, preamble, **fields):
+        key = 'address&offset' if type == 'DDR_CMD' else 'data'
+        self.add(type, **{key: word, 'preamble': preamble, 'parity': hla.ddr_parity(word)}, **fields)
+
+    def ddr_command_word(self, address, command, read):
+        word = (command | (0x80 if read else 0)) << 8 | address << 1
+        self.ddr_word('DDR_CMD', word, 0b01)
+        return hla.ddr_crc5(0x1F, word)
+
+    def ddr(self, address, command, read, data, crc_ok=True, terminate=False, ccc_selector=False):
+        crc = self.ddr_command_word(address, command, read)
+        if len(data) % 2:
+            data = list(data) + [0x00]
+        for i in range(0, len(data), 2):
+            word = data[i] << 8 | data[i + 1]
+            self.ddr_word('DDR_DATA', word, 0b10 if i == 0 else 0b11)
+            crc = hla.ddr_crc5(crc, word)
+        if terminate:
+            # Preamble 2'b10, then the CRC Word without its preamble, which the LLA reads as a Data Word.
+            self.ddr_word('DDR_DATA', 0x3000 | crc << 7, 0b10)
+            self.ddr_word('DDR_DATA', 0xFFFF, 0b11)
+            return
+        self.add('DDR_crc', preamble=0b01, token=0xC, crc=crc if crc_ok else crc ^ 1)
+
+    def ddr_ccc(self, code):
+        crc = self.ddr_command_word(0x7E, 0, False)
+        self.ddr_word('DDR_DATA', code << 8, 0b10)
+        self.add('DDR_crc', preamble=0b01, token=0xC, crc=hla.ddr_crc5(crc, code << 8))
+
+    def ddr_nack(self, address, read):
+        self.ddr_command_word(address, 0x20, read)
+        self.ddr_word('DDR_DATA', 0xFFFF, 0b11)
+
+    def hdr_restart(self):
+        self.add('HDR_restart')
+
+    def hdr_exit(self):
+        self.add('HDR_exit')
+        self.stop()
+
+
 def packet(address, rnw, dest, src, som, eom, seq, to, tag, payload, pec=True):
     flags = (som << 7) | (eom << 6) | (seq << 4) | (to << 3) | tag
     pkt = [0x01, dest, src, flags] + list(payload)
@@ -110,12 +170,14 @@ def run(bus, **settings):
 
 
 class Tests(unittest.TestCase):
+    Bus = Bus
+
     def test_crc8(self):
         # CRC-8/SMBUS check value
         self.assertEqual(hla.crc8(b'123456789'), 0xF4)
 
     def test_control_request_and_response(self):
-        bus = Bus()
+        bus = self.Bus()
         # Get Endpoint ID request, controller (EID 8) -> target 0x09 (EID 9)
         bus.write(0x09, packet(0x09, 0, 9, 8, 1, 1, 0, 1, 2, [0x00, 0x81, 0x02]))
         bus.stop()
@@ -131,7 +193,8 @@ class Tests(unittest.TestCase):
         rq, ibi, rsp = out
         self.assertEqual(rq.data['detail'], 'Get Endpoint ID Rq iid=1')
         self.assertTrue(rq.data['pec_ok'])
-        self.assertEqual((rq.data['src_eid'], rq.data['dest_eid'], rq.data['tag'], rq.data['to']), (8, 9, 2, True))
+        self.assertEqual((rq.data['src_eid'], rq.data['dest_eid'], rq.data['tag'], rq.data['to']),
+                         ('0x08', '0x09', 2, True))
         self.assertIn('pending read', ibi.data['summary'])
         self.assertEqual(rsp.data['detail'], 'Get Endpoint ID Rsp iid=1 cc=SUCCESS')
         self.assertEqual(rsp.data['direction'], 'read')
@@ -140,7 +203,7 @@ class Tests(unittest.TestCase):
     def test_multi_packet_reassembly(self):
         msg = [0x05, 0x12, 0x84] + list(range(100))
         chunks = [msg[0:60], msg[60:]]
-        bus = Bus()
+        bus = self.Bus()
         bus.write(0x10, packet(0x10, 0, 20, 8, 1, 0, 1, 1, 0, chunks[0]))
         bus.stop()
         bus.write(0x10, packet(0x10, 0, 20, 8, 0, 1, 2, 1, 0, chunks[1]))
@@ -154,7 +217,7 @@ class Tests(unittest.TestCase):
         self.assertNotIn('error', last.data)
 
     def test_errors(self):
-        bus = Bus()
+        bus = self.Bus()
         bad = packet(0x09, 0, 9, 8, 1, 1, 0, 1, 0, [0x00, 0x81, 0x02])
         bad[-1] ^= 0xFF
         bus.write(0x09, bad)
@@ -173,7 +236,7 @@ class Tests(unittest.TestCase):
         self.assertIn('seq 2, expected 1', bad_seq.data['error'])
 
     def test_ccc_and_non_mctp_ignored(self):
-        bus = Bus()
+        bus = self.Bus()
         bus.ccc(0x06)                       # broadcast RSTDAA
         bus.stop()
         bus.ccc(0x90)                       # direct GETPID
@@ -188,7 +251,7 @@ class Tests(unittest.TestCase):
         self.assertEqual([f.type for f in shown], ['i3c'])
 
     def test_no_pec_and_address_filter(self):
-        bus = Bus()
+        bus = self.Bus()
         bus.write(0x09, packet(0x09, 0, 9, 8, 1, 1, 0, 1, 0, [0x01, 0x80, 0x02, 0x04], pec=False))
         bus.stop()
         bus.write(0x0B, packet(0x0B, 0, 11, 8, 1, 1, 0, 1, 0, [0x01, 0x80, 0x02, 0x04], pec=False))
@@ -201,8 +264,10 @@ class Tests(unittest.TestCase):
 
 
 class DdrTests(unittest.TestCase):
+    Bus = Bus
+
     def test_mctp_over_ddr(self):
-        bus = Bus()
+        bus = self.Bus()
         bus.enter_ddr()
         # Get Endpoint ID request: 7 packet bytes + PEC = 8 bytes, no padding
         bus.ddr(0x09, 0x20, False, packet(0x09, 0, 9, 8, 1, 1, 0, 1, 2, [0x00, 0x81, 0x02]))
@@ -228,7 +293,7 @@ class DdrTests(unittest.TestCase):
             self.assertNotIn('error', f.data, f.data['summary'])
 
     def test_ddr_errors(self):
-        bus = Bus()
+        bus = self.Bus()
         bus.enter_ddr()
         bus.ddr(0x09, 0x20, False, packet(0x09, 0, 9, 8, 1, 1, 0, 1, 2, [0x00, 0x81, 0x02]), crc_ok=False)
         bus.hdr_restart()
@@ -238,11 +303,11 @@ class DdrTests(unittest.TestCase):
         bus.hdr_exit()
 
         crc, terminated = run(bus)
-        self.assertIn('CRC-5 0x0A != 0x0B', crc.data['error'])
+        self.assertRegex(crc.data['error'], r'CRC-5 0x[0-9A-F]{2} != 0x[0-9A-F]{2}')
         self.assertIn('terminated by Controller', terminated.data['error'])
 
     def test_ddr_ccc_and_other_transfers(self):
-        bus = Bus()
+        bus = self.Bus()
         bus.enter_ddr()
         bus.ddr_ccc(0x00)  # ENEC broadcast
         bus.hdr_restart()
@@ -259,6 +324,46 @@ class DdrTests(unittest.TestCase):
         shown = run(bus, other_transfers=hla.OTHER_SHOW)
         self.assertEqual([f.type for f in shown], ['i3c'])
         self.assertEqual(shown[0].data['summary'], 'DDR W 0x09 cmd=0x2A: 55 66 77 00')
+
+
+class XyphroTests(Tests):
+    Bus = XyphroBus
+
+
+class XyphroDdrTests(DdrTests):
+    Bus = XyphroBus
+
+    def test_ddr_parity_and_crc_checked(self):
+        bus = self.Bus()
+        bus.enter_ddr()
+        bus.ddr(0x09, 0x20, False, packet(0x09, 0, 9, 8, 1, 1, 0, 1, 2, [0x00, 0x81, 0x02]))
+        bus.hdr_exit()
+        bad = [f for f in bus.frames if f.type == 'DDR_DATA'][1]
+        bad.data['parity'] ^= 1
+        (rq,) = run(bus)
+        self.assertIn('parity', rq.data['error'])
+        self.assertNotIn('CRC', rq.data['error'])
+
+    def test_sdr_write_parity_checked(self):
+        bus = self.Bus()
+        bus.write(0x09, packet(0x09, 0, 9, 8, 1, 1, 0, 1, 2, [0x00, 0x81, 0x02]))
+        bus.stop()
+        bus.frames[3].data['ack'] = not bus.frames[3].data['ack']
+        (rq,) = run(bus)
+        self.assertIn('parity', rq.data['error'])
+
+    def test_entdaa_ignored(self):
+        bus = self.Bus()
+        bus.ccc(0x07)
+        bus.start()
+        bus.add('address', address=0x7E, read=True, ack=True)
+        for b in (0x04, 0x6A, 0x00, 0x00, 0x00, 0x01, 0xC6, 0x00):
+            bus.add('entdaaPL', address=b)
+        bus.add('data', data=0x09 << 1, ack=True)
+        bus.stop()
+        bus.write(0x09, packet(0x09, 0, 9, 8, 1, 1, 0, 1, 2, [0x00, 0x81, 0x02]))
+        bus.stop()
+        self.assertEqual([f.data['detail'] for f in run(bus)], ['Get Endpoint ID Rq iid=1'])
 
 
 if __name__ == '__main__':

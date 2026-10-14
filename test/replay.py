@@ -31,6 +31,7 @@ def frames(table, legacy):
 
 mctp.Hla.pec_mode = mctp.PEC_PRESENT; mctp.Hla.address_filter = ''; mctp.Hla.other_transfers = mctp.OTHER_SHOW
 mctp.Hla.spdm_mode = mctp.SPDM_ALL; mctp.Hla.pldm_mode = mctp.PLDM_ON
+mctp.Hla.spdm_columns = mctp.SPDM_COLUMNS_FULL
 m = mctp.Hla()
 for f in frames(sys.argv[1], sys.argv[2]):
     p = m.decode(f)

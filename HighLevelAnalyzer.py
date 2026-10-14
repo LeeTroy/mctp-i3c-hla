@@ -1,6 +1,8 @@
 # MCTP over I3C (DMTF DSP0233) high level analyzer for Saleae Logic 2.
 #
-# Input: frames from the MIPI I3C low level analyzer
+# Input: frames from the XyphroLabs I3C low level analyzer (XyphroLabs-I3C-Saleae-Protocol-Analyzer). XyphroFrames
+# translates them into the frame types below, adding the SDR parity, HDR-DDR parity / CRC-5 checks and CCC tracking
+# that LLA doesn't do. Frames from the MIPI I3C low level analyzer are also accepted as they are:
 #   start, restart, stop, hdr, hdr_exit, hdr_restart
 #   address  {address, read, ack}
 #   ccc      {data, parity_ok, ccc}
@@ -34,6 +36,8 @@ from saleae.analyzers import HighLevelAnalyzer, AnalyzerFrame, StringSetting, Ch
 MCTP_HEADER_VERSION = 0x01
 MDB_PENDING_READ = 0xAE
 I3C_BROADCAST_ADDRESS = 0x7E
+I3C_DDR_CRC_TOKEN = 0xC
+I3C_DDR_CCC_END = 0x1F  # dummy CCC code that ends the HDR-DDR CCC modality
 
 MESSAGE_TYPES = {
     0x00: 'Control',
@@ -330,6 +334,9 @@ def parse_der_certs(chain):
     return count
 
 
+SPDM_SIMPLE_FORMAT = ('SPDM {{data.version}} {{data.message_type}} P1={{data.param1}} P2={{data.param2}} '
+                      'len={{data.message_length}}')
+
 PEC_PRESENT = 'Present (verify)'
 PEC_ABSENT = 'Absent'
 OTHER_HIDE = 'Hide'
@@ -339,6 +346,8 @@ SPDM_ONLY = 'SPDM only'
 SPDM_OFF = 'Off'
 PLDM_ON = 'On'
 PLDM_OFF = 'Off'
+SPDM_COLUMNS_SIMPLE = 'Version, message type, Param1, Param2, length'
+SPDM_COLUMNS_FULL = 'Full decode'
 
 
 def crc8(data, crc=0):
@@ -1149,8 +1158,9 @@ class PldmDecoder:
     def rq_platform_seteventreceiver(self, r, request, fields, details):
         fields['event_global_enable'] = r.u8()
         fields['transport_protocol'] = r.u8()
-        fields['receiver_eid'] = r.u8()
-        details.append('enable=%d receiver EID %d' % (fields['event_global_enable'], fields['receiver_eid']))
+        receiver = r.u8()
+        fields['receiver_eid'] = '0x%02X' % receiver
+        details.append('enable=%d receiver EID %d' % (fields['event_global_enable'], receiver))
         if r.remaining() >= 2:
             fields['heartbeat_timer'] = r.u16()
             details.append('heartbeat=%ds' % fields['heartbeat_timer'])
@@ -1497,6 +1507,133 @@ class PldmDecoder:
 PLDM_TYPE_PREFIXES = {0x00: 'base', 0x02: 'platform', 0x03: 'bios', 0x04: 'fru', 0x05: 'fwup', 0x06: 'rde'}
 
 
+def odd_parity(value):
+    return bin(value).count('1') & 1 == 1
+
+
+def ddr_parity(word):
+    """HDR-DDR parity bits PA1 (odd bits), PA0 (even bits, inverted) of a 16-bit Command / Data Word."""
+    return (odd_parity(word & 0xAAAA) << 1) | (not odd_parity(word & 0x5555))
+
+
+def ddr_crc5(crc, word):
+    """HDR-DDR CRC-5 (x^5 + x^2 + 1, initial value 0x1F), fed MSB first with each 16-bit Command / Data Word."""
+    for i in range(15, -1, -1):
+        feedback = ((word >> i) & 1) ^ ((crc >> 4) & 1)
+        crc = ((crc << 1) & 0x1F) ^ (0x05 if feedback else 0)
+    return crc
+
+
+class XyphroFrames:
+    """Translates frames of the XyphroLabs I3C LLA into the frame types Hla.decode_frame() handles. That LLA reports
+    raw bits only, so the parity and CRC-5 checks, CCC codes and HDR-DDR NACK / early termination are worked out
+    here. Frames of other LLAs pass through unchanged.
+
+    XyphroLabs frames:
+      start, restart, stop, HDR_restart, HDR_exit, Target_reset, entdaaPL {address}
+      address {address, read, ack}
+      data {data, ack}                          ack = SDA low on the rising edge of the T-bit
+      DDR_CMD {address&offset (16 bits), preamble, parity}
+      DDR_DATA {data (16 bits), preamble, parity}
+      DDR_crc {preamble, token, crc}
+    """
+
+    def __init__(self):
+        self.read = False           # direction of the current SDR transfer
+        self.ccc_next = False       # the next data byte is a CCC code (after an ACKed 7'h7E write header)
+        self.ddr = None             # current HDR-DDR Message: {'read', 'indicator', 'first', 'crc', 'done'}
+        self.ddr_ccc_mode = False   # between a DDR CCC and the END CCC: Command Words are Direct CCC Selectors
+
+    def translate(self, frame):
+        kind, data = frame.type, frame.data
+
+        def out(new_kind, **fields):
+            return AnalyzerFrame(new_kind, frame.start_time, frame.end_time, fields)
+
+        if kind in ('start', 'restart'):
+            self.ccc_next = False
+            return frame
+        if kind == 'address':
+            self.read = bool(data['read'])
+            self.ccc_next = (to_int(data['address']) == I3C_BROADCAST_ADDRESS and not self.read and
+                             data.get('ack', True))
+            return frame
+        if kind == 'data':
+            value = to_int(data['data'])
+            t_bit = 0 if data.get('ack', True) else 1
+            if self.ccc_next:
+                self.ccc_next = False
+                return out('ccc', data=value, parity_ok=odd_parity(value << 1 | t_bit))
+            if self.read:
+                return out('read', data=value, more=bool(t_bit))
+            return out('write', data=value, parity_ok=odd_parity(value << 1 | t_bit))
+        if kind == 'entdaaPL':
+            return None
+        if kind == 'Target_reset':
+            self.ddr, self.ddr_ccc_mode = None, False
+            return out('stop')
+        if kind == 'HDR_restart':
+            self.ddr = None
+            return out('hdr_restart')
+        if kind == 'HDR_exit':
+            self.ddr, self.ddr_ccc_mode = None, False
+            return out('hdr_exit')
+        if kind == 'DDR_CMD':
+            return self.ddr_command(frame, out)
+        if kind == 'DDR_DATA':
+            return self.ddr_data(frame, out)
+        if kind == 'DDR_crc':
+            return self.ddr_crc(frame, out)
+        return frame
+
+    def ddr_command(self, frame, out):
+        # Command Word: [15] RnW, [14:8] command code, [7:1] target address, [0] parity adjustment.
+        word = to_int(frame.data['address&offset'])
+        read = bool(word & 0x8000)
+        address = (word >> 1) & 0x7F
+        indicator = address == I3C_BROADCAST_ADDRESS and not read
+        self.ddr = {'read': read, 'indicator': indicator, 'first': True, 'crc': ddr_crc5(0x1F, word),
+                    'done': False}
+        fields = {'read': read, 'command': word >> 8, 'address': address,
+                  'parity_ok': to_int(frame.data['parity']) == ddr_parity(word)}
+        if self.ddr_ccc_mode and not indicator:
+            fields['ccc_selector'] = True
+        return out('ddr_command', **fields)
+
+    def ddr_data(self, frame, out):
+        ddr = self.ddr
+        if ddr is None or ddr['done']:
+            return None
+        first, ddr['first'] = ddr['first'], False
+        preamble = to_int(frame.data['preamble'])
+        if first and preamble == 0b11:
+            ddr['done'] = True
+            return out('ddr_nack', read=ddr['read'])
+        if not first and preamble == 0b10:
+            # Early termination: the LLA keeps reading 20-bit words, so the rest of the Message is out of frame.
+            ddr['done'] = True
+            return out('ddr_end', read=ddr['read'], by='controller' if ddr['read'] else 'target')
+        word = to_int(frame.data['data'])
+        parity_ok = to_int(frame.data['parity']) == ddr_parity(word)
+        ddr['crc'] = ddr_crc5(ddr['crc'], word)
+        if first and ddr['indicator']:
+            # The first Data Word after a CCC Indicator Word carries the CCC code and Defining Byte.
+            ccc = word >> 8
+            self.ddr_ccc_mode = ccc != I3C_DDR_CCC_END
+            return out('ddr_ccc', data=word, ccc_code=ccc, defining_byte=word & 0xFF, parity_ok=parity_ok)
+        return out('ddr_data', data=word, read=ddr['read'], parity_ok=parity_ok)
+
+    def ddr_crc(self, frame, out):
+        ddr, self.ddr = self.ddr, None
+        if ddr is None or ddr['done']:
+            return None
+        token, crc = to_int(frame.data['token']), to_int(frame.data['crc'])
+        fields = {'crc': crc, 'expected': ddr['crc'], 'crc_ok': token == I3C_DDR_CRC_TOKEN and crc == ddr['crc']}
+        if token != I3C_DDR_CRC_TOKEN:
+            fields['token'] = token
+        return out('ddr_crc', **fields)
+
+
 class Transfer:
     """Bytes of one I3C private transfer, from the address header to the next START / Sr / STOP, or of one HDR-DDR
     Message, from the Command Word to its CRC Word."""
@@ -1523,6 +1660,7 @@ class Hla(HighLevelAnalyzer):
     other_transfers = ChoicesSetting(label='Non-MCTP private transfers', choices=(OTHER_HIDE, OTHER_SHOW))
     spdm_mode = ChoicesSetting(label='SPDM decoding', choices=(SPDM_ALL, SPDM_ONLY, SPDM_OFF))
     pldm_mode = ChoicesSetting(label='PLDM decoding', choices=(PLDM_ON, PLDM_OFF))
+    spdm_columns = ChoicesSetting(label='SPDM table columns', choices=(SPDM_COLUMNS_SIMPLE, SPDM_COLUMNS_FULL))
 
     result_types = {
         'packet': {'format': '{{data.summary}}'},
@@ -1532,10 +1670,15 @@ class Hla(HighLevelAnalyzer):
         'response': {'format': '{{data.summary}}'},
         'error': {'format': '{{data.summary}}'},
         'secured': {'format': '{{data.summary}}'},
+        'spdm_request': {'format': SPDM_SIMPLE_FORMAT},
+        'spdm_response': {'format': SPDM_SIMPLE_FORMAT},
+        'spdm_error': {'format': 'ERR ' + SPDM_SIMPLE_FORMAT},
+        'spdm_secured': {'format': 'SPDM {{data.message_type}} len={{data.message_length}}'},
     }
 
     def __init__(self):
         self.pec_enabled = self.pec_mode != PEC_ABSENT
+        self.spdm_simple = self.spdm_columns != SPDM_COLUMNS_FULL
         self.show_other = self.other_transfers == OTHER_SHOW
         filt = (self.address_filter or '').strip()
         self.filter = int(filt, 16) if filt else None
@@ -1550,8 +1693,13 @@ class Hla(HighLevelAnalyzer):
         self.after_start = False  # the next address header follows a START, not an Sr
         self.direct_ccc = False   # inside a direct CCC: Sr + address transfers are CCC payloads
         self.messages = {}        # reassembly key -> {'seq', 'data', 'start_time'}
+        self.xyphro = XyphroFrames()
 
     def decode(self, frame):
+        frame = self.xyphro.translate(frame)
+        return None if frame is None else self.decode_frame(frame)
+
+    def decode_frame(self, frame):
         kind = frame.type
 
         if kind in ('start', 'restart', 'stop', 'hdr', 'hdr_exit', 'hdr_restart'):
@@ -1703,7 +1851,7 @@ class Hla(HighLevelAnalyzer):
         if self.pec_enabled:
             packet, pec = data[:-1], data[-1]
             expected = crc8([(transfer.address << 1) | transfer.read] + packet)
-            fields['pec'] = pec
+            fields['pec'] = '0x%02X' % pec
             fields['pec_ok'] = pec == expected
             if pec != expected:
                 errors.append('PEC 0x%02X != 0x%02X' % (pec, expected))
@@ -1726,8 +1874,8 @@ class Hla(HighLevelAnalyzer):
         payload = packet[4:]
 
         fields.update({
-            'dest_eid': dest,
-            'src_eid': src,
+            'dest_eid': '0x%02X' % dest,  # strings: Logic 2 shows integers at full width in the table
+            'src_eid': '0x%02X' % src,
             'som': som,
             'eom': eom,
             'seq': seq,
@@ -1805,11 +1953,13 @@ class Hla(HighLevelAnalyzer):
 
     def message_frame(self, transfer, fields, body, decoded, packet_errors):
         kind, message_fields, details, errors = decoded
+        if self.spdm_simple and message_fields.get('protocol') == 'SPDM':
+            return self.spdm_simple_frame(transfer, body, kind, message_fields, packet_errors + errors)
         fields['message'] = hex_bytes(body)
         fields['message_len'] = len(body)
         fields.update(message_fields)
         parts = [transfer.label(),
-                 'EID %d->%d' % (fields['src_eid'], fields['dest_eid'])] + details
+                 'EID %d->%d' % (int(fields['src_eid'], 16), int(fields['dest_eid'], 16))] + details
         if not fields['som']:
             parts.append('(%d bytes)' % len(body))
         errors = packet_errors + errors
@@ -1822,3 +1972,20 @@ class Hla(HighLevelAnalyzer):
                 kind = 'error'
         fields['summary'] = ' | '.join(parts)
         return AnalyzerFrame(kind, transfer.start_time, transfer.end_time, fields)
+
+    def spdm_simple_frame(self, transfer, body, kind, message_fields, errors):
+        """SPDM frame with only the version, message type, Param1, Param2 and message length columns."""
+        fields = {}
+        if kind == 'secured':
+            fields['message_type'] = 'SECURED_MESSAGE'
+        elif 'name' in message_fields:
+            fields['version'] = message_fields['version']
+            fields['message_type'] = message_fields['name']
+            fields['param1'] = '0x%02X' % message_fields['param1']
+            fields['param2'] = '0x%02X' % message_fields['param2']
+        else:
+            fields['message_type'] = 'TRUNCATED'
+        fields['message_length'] = len(body) - 1  # SPDM message, without the MCTP message type byte
+        if errors and kind != 'secured':
+            kind = 'error'
+        return AnalyzerFrame('spdm_' + kind, transfer.start_time, transfer.end_time, fields)

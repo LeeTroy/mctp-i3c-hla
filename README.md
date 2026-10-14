@@ -1,6 +1,6 @@
 # MCTP over I3C — Saleae Logic 2 High Level Analyzer
 
-Decodes DMTF **MCTP over I3C** (DSP0233) traffic and, optionally, **PLDM** (DSP0240 / DSP0241), **SPDM** (DSP0274) and **secured SPDM** (DSP0277 / DSP0275) messages carried over it. It runs on top of the [MIPI I3C low level analyzer](../mipi-i3c-lla).
+Decodes DMTF **MCTP over I3C** (DSP0233) traffic and, optionally, **PLDM** (DSP0240 / DSP0241), **SPDM** (DSP0274) and **secured SPDM** (DSP0277 / DSP0275) messages carried over it. It runs on top of the [XyphroLabs I3C low level analyzer](../XyphroLabs-I3C-Saleae-Protocol-Analyzer). It still accepts the frames of the [MIPI I3C low level analyzer](../mipi-i3c-lla) as well.
 
 Logic 2 only lets an HLA take a low level analyzer as its input, so SPDM can't be a separate HLA stacked on this one. The SPDM decoder from [spdm-mctp-hla](../spdm-mctp-hla) is built in here instead and is turned on with the **SPDM decoding** setting.
 
@@ -14,7 +14,7 @@ Logic 2 only lets an HLA take a low level analyzer as its input, so SPDM can't b
 - Message detail for MCTP Control (command, Rq/Rsp, instance ID, completion code), PLDM (type, command, completion code) and SPDM (version, request/response code)
 - IBI with MDB `0xAE` (MCTP pending read) shown as an `ibi` frame
 - Broadcast and direct CCC traffic and NACKed headers are ignored. Optionally, non-MCTP private transfers are shown raw.
-- HDR-DDR: MCTP packets in the Data Words of DDR Write / Read Commands are decoded like SDR transfers. The summary starts with `DDR W` / `DDR R`, and the frame gets `mode` = `HDR-DDR` and `ddr_command`. LLA CRC-5 and parity errors, early termination and framing errors show up in `error`. NACKed Commands, CCC Indicator Words and Direct CCC Selector Words are ignored.
+- HDR-DDR: MCTP packets in the Data Words of DDR Write / Read Commands are decoded like SDR transfers. The summary starts with `DDR W` / `DDR R`, and the frame gets `mode` = `HDR-DDR` and `ddr_command`. CRC-5 and parity errors, early termination and (MIPI LLA only) framing errors show up in `error`. NACKed Commands, CCC Indicator Words and Direct CCC Selector Words are ignored.
 
 ### PLDM decoding
 
@@ -33,7 +33,14 @@ When it's on, the frame of the EOM packet of each PLDM message becomes a `reques
 
 ### SPDM decoding
 
-When it's on, the frame of the EOM packet of each SPDM message becomes a `request` / `response` / `error` / `secured` frame with the full SPDM decode. Logic 2 HLA frames can't overlap, so there is no frame spanning SOM to EOM. In a multi-packet message the earlier packets stay `packet` frames, and the SOM packet shows the SPDM code name.
+When it's on, the frame of the EOM packet of each SPDM message becomes an SPDM frame. Logic 2 HLA frames can't overlap, so there is no frame spanning SOM to EOM. In a multi-packet message the earlier packets stay `packet` frames, and the SOM packet shows the SPDM code name.
+
+The **SPDM table columns** setting picks what these frames carry:
+
+- `Version, message type, Param1, Param2, length` (default): `spdm_request` / `spdm_response` / `spdm_error` / `spdm_secured` frames with only `version`, `message_type`, `param1`, `param2` and `message_length` (the SPDM message without the MCTP message type byte). A secured message has only `message_type` (`SECURED_MESSAGE`) and `message_length`. These frames don't carry the MCTP packet fields, the error text or the payload decode below. A packet error (PEC, parity) or SPDM `ERROR` makes it an `spdm_error` frame.
+- `Full decode`: `request` / `response` / `error` / `secured` frames with all packet fields and the full decode listed below.
+
+Full decode:
 
 - Header: SPDM version, request/response code name, Param1/Param2
 - Request/response pairing per connection: response latency (`latency_ms`, from the end of the request to the SOM of the response) and a flag when a response doesn't match the outstanding request
@@ -57,12 +64,14 @@ When it's on, the frame of the EOM packet of each SPDM message becomes a `reques
 |------|------|-------------|
 | `packet` | one per MCTP packet | `address`, `direction`, `dest_eid`, `src_eid`, `som`, `eom`, `seq`, `to`, `tag`, `msg_type`, `ic`, `payload`, `pec`, `pec_ok`, `error` |
 | | on EOM | `message` (reassembled, starts with the message type byte), `message_len`, `detail` |
+| | EIDs and `pec` are 1-byte hex strings (`0x08`): Logic 2 shows integers at full width in the table | |
 | `ibi` | IBI after START | `address`, `mdb`, `data` |
 | `i3c` | non-MCTP private transfer (only if enabled) | `address`, `direction`, `data` |
 | `request` / `response` | EOM packet of a PLDM message (PLDM decoding on) | all `packet` fields, `message`, plus `protocol` (`PLDM`), `pldm_type`, `command`, `command_code`, `iid`, `datagram`, `cc`, `raw`, `latency_ms` and command-specific fields |
-| `request` / `response` | EOM packet of an SPDM message (SPDM decoding on) | all `packet` fields, `message`, plus `protocol` (`SPDM`), `version`, `code`, `name`, `param1`, `param2`, `raw`, `request`, `latency_ms` and message-specific fields |
+| `spdm_request` / `spdm_response` / `spdm_error` / `spdm_secured` | EOM packet of an SPDM message (SPDM decoding on, default columns) | `version`, `message_type`, `param1`, `param2`, `message_length` |
+| `request` / `response` | EOM packet of an SPDM message (SPDM decoding on, `Full decode` columns) | all `packet` fields, `message`, plus `protocol` (`SPDM`), `version`, `code`, `name`, `param1`, `param2`, `raw`, `request`, `latency_ms` and message-specific fields |
 | `error` | as above, for a PLDM completion code other than SUCCESS, an SPDM `ERROR`, a mismatched SPDM response, a truncated or malformed message, or a packet error (PEC, parity) | as above, plus `error` |
-| `secured` | EOM packet of a secured SPDM message (only with `SPDM and secured messages`) | all `packet` fields, `session_id`, `secured_seq`, `length`, `raw` |
+| `secured` | EOM packet of a secured SPDM message (only with `SPDM and secured messages` and `Full decode`) | all `packet` fields, `session_id`, `secured_seq`, `length`, `raw` |
 
 ## Settings
 
@@ -71,12 +80,28 @@ When it's on, the frame of the EOM packet of each SPDM message becomes a `reques
 - **Non-MCTP private transfers**: hide or show them raw
 - **PLDM decoding**: `On` (default) or `Off` (plain MCTP packets with the short `detail` text)
 - **SPDM decoding**: `SPDM and secured messages` (default), `SPDM only` (secured messages stay `packet` frames), or `Off` (plain MCTP packets with the short `detail` text)
+- **SPDM table columns**: `Version, message type, Param1, Param2, length` (default) or `Full decode`
 
 ## Usage
 
-1. Load the I3C LLA (`CustomLLA/libmipi_i3c_analyzer.so`) and add **MIPI I3C** on SCL/SDA.
+1. Build the XyphroLabs LLA (`cmake -S . -B build && cmake --build build` in `XyphroLabs-I3C-Saleae-Protocol-Analyzer`), point **Preferences → Custom Low Level Analyzers** at its `build/bin/`, restart Logic 2, and add **I3C (XyphroLabs)** on SCL/SDA.
 2. In the Extensions panel choose **⋮ → Load Existing Extension…** and pick `mctp-i3c-hla/extension.json`.
-3. Add the **MCTP over I3C** analyzer and select the MIPI I3C analyzer as its input.
+3. Add the **MCTP over I3C** analyzer and select the I3C (XyphroLabs) analyzer as its input.
+
+### XyphroLabs LLA input
+
+The XyphroLabs LLA reports the raw bits, and `XyphroFrames` in `HighLevelAnalyzer.py` derives the rest:
+
+| LLA frame | Derived |
+|-----------|---------|
+| `address {address, read, ack}` | direction of the following `data` bytes; an ACKed `7'h7E` write makes the next byte a CCC code |
+| `data {data, ack}` | write: odd-parity check of the T-bit (`ack` = T-bit low); read: T-bit = more data |
+| `DDR_CMD {address&offset, preamble, parity}` | RnW, command code, target address, PA1/PA0 check, Direct CCC Selector Word |
+| `DDR_DATA {data, preamble, parity}` | PA1/PA0 check; preamble `2'b11` on the first Data Word = NACK, `2'b10` on a later one = early termination; CCC code after a CCC Indicator Word |
+| `DDR_crc {preamble, token, crc}` | CRC-5 over the Command and Data Words, token check |
+| `HDR_restart`, `HDR_exit`, `Target_reset`, `entdaaPL` | HDR Restart / Exit, Target Reset ends the transfer, ENTDAA payload ignored |
+
+After an HDR-DDR early termination this LLA loses word alignment, so the rest of that Message (including its CRC Word) is skipped.
 
 ## Limitations
 
@@ -101,4 +126,4 @@ python3 test/test_spdm.py   # SPDM decoding, end to end from I3C frames
 
 `test/saleae/` is a minimal stub of the Logic 2 `saleae.analyzers` module. The tests replay LLA frame sequences.
 
-`test/replay.py <table.csv> <legacy_hex.txt>` replays a real capture through this HLA with PLDM and SPDM decoding on. Its inputs are a Logic 2 data table export of the MIPI I3C analyzer and a legacy hex export of the same analyzer.
+`test/test_hla.py` runs every scenario against both the MIPI and XyphroLabs frame formats. `test/replay.py <table.csv> <legacy_hex.txt>` replays a real capture through this HLA with PLDM and SPDM decoding on. Its inputs are a Logic 2 data table export of the MIPI I3C analyzer and a legacy hex export of the same analyzer.

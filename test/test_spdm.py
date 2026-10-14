@@ -49,7 +49,7 @@ class Link:
 
 def run(link, kinds=('request', 'response', 'error', 'secured'), **settings):
     for name, value in {'pec_mode': hla.PEC_PRESENT, 'address_filter': '', 'other_transfers': hla.OTHER_HIDE,
-                        'spdm_mode': hla.SPDM_ALL, **settings}.items():
+                        'spdm_mode': hla.SPDM_ALL, 'spdm_columns': hla.SPDM_COLUMNS_FULL, **settings}.items():
         setattr(hla.Hla, name, value)
     analyzer = hla.Hla()
     out = []
@@ -146,7 +146,7 @@ class Tests(unittest.TestCase):
         self.assertIn('SPDM | KEY_EXCHANGE', out[0].data['summary'])
         self.assertEqual(out[1].data['name'], 'KEY_EXCHANGE')
         self.assertEqual(out[1].data['message_len'], 1 + 4 + 4 + 100)
-        self.assertEqual((out[1].data['src_eid'], out[1].data['dest_eid']), (BMC_EID, DEV_EID))
+        self.assertEqual((out[1].data['src_eid'], out[1].data['dest_eid']), ('0x08', '0x09'))
         self.assertIn('(109 bytes)', out[1].data['summary'])
         self.assertIn('PEC OK', out[1].data['summary'])
 
@@ -163,6 +163,33 @@ class Tests(unittest.TestCase):
 
         out = run(link, kinds=('packet',), spdm_mode=hla.SPDM_OFF)
         self.assertEqual(out[0].data['detail'], 'v1.0 GET_VERSION')
+
+    def test_simple_columns(self):
+        link = Link()
+        link.request([0x12, 0xE4, 0x02, 0x01] + u16(0xFFFF) + [0, 0] + [0x77] * 100)
+        link.response([0x12, 0x64, 0, 0] + u16(0xFFFE) + [0, 0] + [0x99] * 32)
+        link.send([0x06] + u32(0xFFFEFFFF) + u16(0) + u16(20) + [0xAB] * 20, False, 1)
+        link.request([0x12, 0xE5, 0, 0] + [0] * 48)
+        link.response([0x12, 0x7F, 0x42, 0, 10, 0xE5, 3, 2])
+        frames = link.bus.frames
+        last_write = max(i for i, f in enumerate(frames) if f.type == 'write')
+        frames[last_write].data['data'] ^= 0xFF  # PEC error on the FINISH request
+
+        kinds = ('spdm_request', 'spdm_response', 'spdm_error', 'spdm_secured')
+        out = run(link, kinds=kinds, spdm_columns=hla.SPDM_COLUMNS_SIMPLE)
+        self.assertEqual([f.type for f in out],
+                         ['spdm_request', 'spdm_response', 'spdm_secured', 'spdm_error', 'spdm_error'])
+        self.assertEqual(out[0].data, {'version': '1.2', 'message_type': 'KEY_EXCHANGE', 'param1': '0x02',
+                                       'param2': '0x01', 'message_length': 108})
+        self.assertEqual(out[1].data['message_type'], 'KEY_EXCHANGE_RSP')
+        self.assertEqual(out[2].data, {'message_type': 'SECURED_MESSAGE', 'message_length': 28})
+        self.assertEqual(out[3].data['message_type'], 'FINISH')
+        self.assertEqual(out[4].data['param1'], '0x42')
+        for f in out:
+            self.assertLessEqual(set(f.data), {'version', 'message_type', 'param1', 'param2', 'message_length'})
+        for kind in kinds:
+            self.assertIn(kind, hla.Hla.result_types)
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
